@@ -1,3 +1,5 @@
+.cache.mk
+
 # Prerequisites
 *.d
 
