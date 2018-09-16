@@ -25,31 +25,20 @@ static struct user_space_block_dev {
         struct gendisk *gd;
 } dev;
 
-struct block_device_operations {
-    int (*open) (struct block_device *, fmode_t);
-    int (*release) (struct gendisk *, fmode_t);
-    int (*locked_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
-    int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
-    int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
-    int (*direct_access) (struct block_device *, sector_t, void **, unsigned long *);
-    int (*media_changed) (struct gendisk *);
-    int (*revalidate_disk) (struct gendisk *);
-    int (*getgeo)(struct block_device *, struct hd_geometry *);
-    struct module *owner;
-}
-
 /**
  * Open fucntion for the block device
  */
-static int usbd_open(struct block_device *, fmode_t mode)
+static int usbd_open(struct block_device *blk_dev, fmode_t mode)
 {
         printk(KERN_INFO "Opened usbd");
+
+        return 0;
 }
 
 /**
  * Release fucntion for the block device
  */
-static int usbd_release(struct gendisk *, fmode_t mode)
+static void usbd_release(struct gendisk *gd, fmode_t mode)
 {
         printk(KERN_INFO "Released usbd");
 }
@@ -77,7 +66,7 @@ static int create_block_device(struct user_space_block_dev *dev)
         if(dev->queue == NULL)
                 goto out_err;
 
-        blk_queue_logical_block_size(dev->queue, KERNEL_SECTOR_SIZE);
+        blk_queue_logical_block_size(dev->queue, 512); // TODO: look up what happened to KERNEL_SECTOR_SIZE
         dev->queue->queuedata = dev;
 
         dev->gd->major = USER_SPACE_BLKDEV_MAJOR;
@@ -86,7 +75,7 @@ static int create_block_device(struct user_space_block_dev *dev)
         dev->gd->queue = dev->queue;
         dev->gd->private_data = dev;
         snprintf (dev->gd->disk_name, 32, "usbd");
-        set_capacity(dev->gd, NR_SECTORS);
+        set_capacity(dev->gd, 1024); // just pick a random size for now
 
         add_disk(dev->gd);
 
@@ -97,9 +86,9 @@ out_err:
 
 int init_module(void)
 {
-        printk(KERN_INFO "Init usbd\n");
-
         int status;
+
+        printk(KERN_INFO "Init usbd\n");
 
         status = register_blkdev(USER_SPACE_BLKDEV_MAJOR, USER_SPACE_BLKDEV_NAME);
 
