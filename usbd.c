@@ -61,6 +61,7 @@ static blk_qc_t usbd_make_request(struct request_queue *q, struct bio *bio)
                 printk(KERN_INFO "Writing %u sectors starting at %lu", nsectors, sector);
             } else {
                 printk(KERN_INFO "Reading %u sectors starting at %lu", nsectors, sector);
+                memset(buffer, 0xBB, bio_cur_bytes(bio));
             }
 
             sector += nsectors; // update the current sector
@@ -223,6 +224,6 @@ module_exit(usbd_exit);
 
 
 MODULE_VERSION(DRIVER_VERSION);
-MODULE_LICENSE("GPL v3");
+MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
