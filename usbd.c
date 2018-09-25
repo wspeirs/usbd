@@ -34,6 +34,14 @@
 static int DEVICE_SIZE = 1024; // size in sectors
 module_param(DEVICE_SIZE, int, 0444); // make world-readable
 
+/**
+ * The current state our device is in
+ */
+typedef enum driver_state {
+    WAITING_ON_BLK_DEV_REQUEST,
+    WAITING_ON_PROC_RESPONSE
+} driver_state_t;
+
 
 /**
  * Representation of the block device
@@ -43,23 +51,28 @@ static struct usbd_dev {
     int open_count;
     struct request_queue *queue;
     struct gendisk *gd;
+    wait_queue_head_t wait_queue;
+    driver_state_t driver_state;
 } dev;
+
+struct io_request_response_t {
+    unsigned int type; // 1 = write; 0 = read
+    size_t amount;  // < 0 for error
+} request_response;
 
 /**
  * Representation of the IO mechanism between the block device and the user proc.
  */
-static struct usbd_io {
+struct usbd_io {
     spinlock_t lock;  // lock for modifying the struct
-    wait_queue_head_t inq, outq;  // read and write queues
     char *buffer;  // IO buffer between device and user proc
-};
+} io;
 
 /**
- * Handle transfering data to/from the device
+ * Handle transferring data to/from the device
  */
 static blk_qc_t usbd_make_request(struct request_queue *q, struct bio *bio)
 {
-//	struct usbd_dev *dev = q->queuedata;
 	struct bio_vec bvec;
     struct bvec_iter iter;
 	sector_t sector = bio->bi_iter.bi_sector;
@@ -71,18 +84,54 @@ static blk_qc_t usbd_make_request(struct request_queue *q, struct bio *bio)
         // loop through each segment
         bio_for_each_segment(bvec, bio, iter) {
             char *buffer = kmap_atomic(bvec.bv_page) + bvec.bv_offset; // map in our buffer
-            unsigned nsectors = bio_cur_bytes(bio) >> SECTOR_SHIFT; // get the number of sectors
+            unsigned buffer_size = bio_cur_bytes(bio); // get the size of the buffer
+            unsigned cur_offset = 0;
 
-            if(bio_data_dir(bio) == WRITE) {
-                printk(KERN_INFO "Writing %u sectors starting at %lu", nsectors, sector);
-            } else {
-                printk(KERN_INFO "Reading %u sectors starting at %lu", nsectors, sector);
-                memset(buffer, 0xBB, bio_cur_bytes(bio));
+            // go through the buffer's size, a page at a time
+            while(cur_offset < buffer_size) {
+                size_t amt = min(buffer_size - cur_offset, (unsigned) PAGE_SIZE);
+
+                if(bio_data_dir(bio) == WRITE) {
+                    printk(KERN_INFO "Writing %u bytes starting at %lu", buffer_size, sector);
+
+                    // copy the request into the IO buffer
+                    memcpy(io.buffer, buffer, amt);
+
+                    // fill out the io_request_response_t
+                    request_response.amount = amt;
+                    request_response.type = 1;
+
+                    // set the state of the driver
+                    dev.driver_state = WAITING_ON_PROC_RESPONSE;
+
+                    // put ourself on the wait queue
+                    wait_event_interruptible(dev.wait_queue, dev.driver_state == WAITING_ON_BLK_DEV_REQUEST);
+                } else {
+                    printk(KERN_INFO "Reading %u bytes starting at %lu", buffer_size, sector);
+
+                    // set the state of the driver
+                    dev.driver_state = WAITING_ON_PROC_RESPONSE;
+
+                    // put ourself on the wait queue
+                    wait_event_interruptible(dev.wait_queue, dev.driver_state == WAITING_ON_BLK_DEV_REQUEST);
+
+                    if(request_response.amount > 0) {
+                        // read the response from the proc
+                        memcpy(buffer, io.buffer, amt);
+                    } else {
+                        printk(KERN_ERR "Got an error response back: %lu", request_response.amount);
+                    }
+                }
+
+                // update our offset
+                cur_offset += amt;
             }
 
-            sector += nsectors; // update the current sector
+            // update the current sector
+            sector += (buffer_size >> SECTOR_SHIFT);
 
-            kunmap_atomic(buffer);  // unmap the buffer
+            // unmap the buffer
+            kunmap_atomic(buffer);
         }
         break;
 
@@ -96,15 +145,22 @@ static blk_qc_t usbd_make_request(struct request_queue *q, struct bio *bio)
 }
 
 /**
- * Open function     for the block device
+ * Open function for the block device
  */
 static int usbd_open(struct block_device *blk_dev, fmode_t mode)
 {
 	struct usbd_dev *dev = blk_dev->bd_disk->private_data;
 
-    // acquire lock, bump count, unlock
+    // acquire lock
     spin_lock(&dev->lock);
+
+    // increment our count
     dev->open_count += 1;
+
+    // set our state
+    dev->driver_state = WAITING_ON_BLK_DEV_REQUEST;
+
+    // unlock
     spin_unlock(&dev->lock);
 
     // this could be wrong as we don't have the lock
@@ -120,9 +176,13 @@ static void usbd_release(struct gendisk *gd, fmode_t mode)
 {
     struct usbd_dev *dev = gd->private_data;
 
-    // acquire lock, bump count, unlock
+    // acquire lock
     spin_lock(&dev->lock);
+
+    // decrement our open count
     dev->open_count -= 1;
+
+    // unlock
     spin_unlock(&dev->lock);
 
     // this could be wrong as we don't have the lock
@@ -150,14 +210,14 @@ static int create_block_device(struct usbd_dev *dev)
         return -EBUSY;
     }
 
-    // setup the I/O queue without queueing
+    // setup the block device queue without queueing
     dev->queue = blk_alloc_queue(GFP_KERNEL);
 
     if (dev->queue == NULL)
         goto out_err;
 
+    // set the request handling function for the block device
     blk_queue_make_request(dev->queue, usbd_make_request);
-
 
     // set the logical block size to 512, same as the kernel block size
     blk_queue_logical_block_size(dev->queue, SECTOR_SIZE);
@@ -179,6 +239,12 @@ static int create_block_device(struct usbd_dev *dev)
     dev->gd->private_data = dev;
     snprintf (dev->gd->disk_name, 32, "usbd");
     set_capacity(dev->gd, DEVICE_SIZE); // set the capacity, in sectors of the device
+
+    // configure the queue to wait for handling requests
+    init_waitqueue_head(&dev->wait_queue);
+
+    // set the state of the driver
+    dev->driver_state = WAITING_ON_BLK_DEV_REQUEST;
 
     // set the open count to zero
     dev->open_count = 0;
@@ -214,18 +280,23 @@ static void delete_block_device(struct usbd_dev *dev)
 static void vm_open(struct vm_area_struct *area)
 {
     printk(KERN_INFO "vm_open: %lu -> %lu\n", area->vm_start, area->vm_end);
-
 }
 
 static void vm_close(struct vm_area_struct * area)
 {
     printk(KERN_INFO "vm_close\n");
-
 }
 
 static int fault(struct vm_fault *vmf)
 {
+    struct page *page;
+
     printk(KERN_INFO "vm_fault\n");
+
+    // convert the kernel VM buffer to a page
+    page = virt_to_page(io.buffer);
+    get_page(page);
+    vmf-> page = page;
 
     return 0;
 }
@@ -238,7 +309,7 @@ struct vm_operations_struct vm_ops = {
 
 static int io_mmap(struct file *f, struct vm_area_struct *vma)
 {
-    printk(KERN_INFO "mmap mmap\n");
+    printk(KERN_INFO "io_mmap\n");
 
     vma->vm_ops = &vm_ops;
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
@@ -249,16 +320,12 @@ static int io_mmap(struct file *f, struct vm_area_struct *vma)
 
 static int io_open(struct inode *node, struct file *f)
 {
-    struct usbd_io *io;
-
     printk(KERN_INFO "io_open\n");
 
-    // allocate a structure for this open
-    io = kmalloc(sizeof(struct usbd_io), GFP_KERNEL);
+    io.buffer = (char *)get_zeroed_page(GFP_KERNEL);
 
-    // get a zeroed page to use for IO
-    io->buffer = (char *)get_zeroed_page(GFP_KERNEL);
-    f->private_data = io;
+    // set our IO struct to the private data
+    f->private_data = &io;
 
     return 0;
 }
@@ -267,9 +334,19 @@ static int io_release(struct inode *node, struct file *f)
 {
     printk(KERN_INFO "io_release\n");
 
+    // lock the structure
+    spin_lock(&io.lock);
+
     // release our IO page
-    free_page((unsigned long) f->private_data);
+    if(io.buffer != NULL) {
+        free_page((unsigned long) io.buffer);
+        io.buffer = NULL;
+    }
+
     f->private_data = NULL;
+
+    // unlock the structure
+    spin_unlock(&io.lock);
 
     return 0;
 }
@@ -278,14 +355,27 @@ static ssize_t io_read(struct file *f, char __user *buff, size_t amt, loff_t *of
 {
     printk(KERN_INFO "io_read: %zu at %lld\n", amt, *offset);
 
-    return 0;
+    // wait to process a response
+    wait_event_interruptible(dev.wait_queue, dev.driver_state == WAITING_ON_PROC_RESPONSE);
+
+    // copy the io_request_response_t into the buffer
+    memcpy(buff, &request_response, sizeof(struct io_request_response_t));
+
+    printk(KERN_INFO "io_read: response type: %u", request_response.type);
+
+    // return the size of the struct
+    return sizeof(struct io_request_response_t);
 }
 
 static ssize_t io_write(struct file *f, const char __user *buff, size_t amt, loff_t *offset)
 {
     printk(KERN_INFO "io_write: %zu at %lld\n", amt, *offset);
 
-    return 0;
+    // set our driver state as the proc returned from processing the request
+    dev.driver_state = WAITING_ON_BLK_DEV_REQUEST;
+
+    // simply return that we wrote whatever was sent to us
+    return amt;
 }
 
 struct file_operations io_ops = {
@@ -294,7 +384,8 @@ struct file_operations io_ops = {
     .release = io_release,
     .read = io_read,
     .write = io_write,
-    .mmap = io_mmap
+    .mmap = io_mmap,
+    .llseek = no_llseek // we don't want to be able to seek in this file
 };
 
 static int create_io_file(void)
