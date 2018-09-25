@@ -3,6 +3,9 @@
 #include <linux/uio_driver.h>
 #include <linux/genhd.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/mm_types.h>
+#include <linux/proc_fs.h>
 #include <linux/blkdev.h>
 
 
@@ -13,6 +16,7 @@
 /**
  * Block device code tutorial: https://linux-kernel-labs.github.io/master/labs/block_device_drivers.html
  * Block device code example:  https://github.com/martinezjavier/ldd3/
+ * MMAP example: https://stackoverflow.com/a/45645732/3723253
  */
 
 /**
@@ -32,11 +36,20 @@ module_param(DEVICE_SIZE, int, 0444); // make world-readable
  * Representation of the device
  */
 static struct usbd_dev {
+    spinlock_t lock;  // lock for modifying the struct
     int open_count;
-    spinlock_t lock;
     struct request_queue *queue;
     struct gendisk *gd;
 } dev;
+
+/**
+ * Representation of the IO mechanism between the block device and the user proc.
+ */
+static struct usbd_io {
+    spinlock_t lock;  // lock for modifying the struct
+    wait_queue_head_t inq, outq;  // read and write queues
+    char *buffer;  // IO buffer between device and user proc
+};
 
 /**
  * Handle transfering data to/from the device
@@ -195,6 +208,101 @@ static void delete_block_device(struct usbd_dev *dev)
     unregister_blkdev(USER_SPACE_BLKDEV_MAJOR, USER_SPACE_BLKDEV_NAME);
 }
 
+static void vm_open(struct vm_area_struct *area)
+{
+    printk(KERN_INFO "vm_open: %lu -> %lu\n", area->vm_start, area->vm_end);
+
+}
+
+static void vm_close(struct vm_area_struct * area)
+{
+    printk(KERN_INFO "vm_close\n");
+
+}
+
+static int fault(struct vm_fault *vmf)
+{
+    printk(KERN_INFO "vm_fault\n");
+
+    return 0;
+}
+
+struct vm_operations_struct vm_ops = {
+    .open = vm_open,
+    .close = vm_close,
+    .fault = fault
+};
+
+static int io_mmap(struct file *f, struct vm_area_struct *vma)
+{
+    printk(KERN_INFO "mmap mmap\n");
+
+    vma->vm_ops = &vm_ops;
+    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    vma->vm_private_data = f->private_data;
+
+    return 0;
+}
+
+static int io_open(struct inode *node, struct file *f)
+{
+    struct usbd_io *io;
+
+    printk(KERN_INFO "io_open\n");
+
+    // allocate a structure for this open
+    io = kmalloc(sizeof(struct usbd_io), GFP_KERNEL);
+
+    // get a zeroed page to use for IO
+    io->buffer = (char *)get_zeroed_page(GFP_KERNEL);
+    f->private_data = io;
+
+    return 0;
+}
+
+static int io_release(struct inode *node, struct file *f)
+{
+    printk(KERN_INFO "io_release\n");
+
+    // release our IO page
+    free_page((unsigned long) f->private_data);
+    f->private_data = NULL;
+
+    return 0;
+}
+
+static ssize_t io_read(struct file *f, char __user *buff, size_t amt, loff_t *offset)
+{
+    printk(KERN_INFO "io_read: %zu at %lld\n", amt, *offset);
+
+    return 0;
+}
+
+static ssize_t io_write(struct file *f, const char __user *buff, size_t amt, loff_t *offset)
+{
+    printk(KERN_INFO "io_write: %zu at %lld\n", amt, *offset);
+
+    return 0;
+}
+
+struct file_operations io_ops = {
+    .owner = THIS_MODULE,
+    .open = io_open,
+    .release = io_release,
+    .read = io_read,
+    .write = io_write,
+    .mmap = io_mmap
+};
+
+static int create_io_file(void)
+{
+    printk(KERN_INFO "create_io_file\n");
+
+    proc_create("usbd_io", 0, NULL, &io_ops);
+
+    return 0;
+}
+
 /*
  * Module init function.
  */
@@ -203,6 +311,8 @@ static int __init usbd_init(void)
     int status;
 
     printk(KERN_INFO "Init usbd\n");
+
+    create_io_file();
 
     if((status = create_block_device(&dev)) < 0)
         return status;
