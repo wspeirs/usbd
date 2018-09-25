@@ -6,9 +6,6 @@
 #include <linux/blkdev.h>
 
 
-#define DRIVER_VERSION	"0.0.1"
-#define DRIVER_AUTHOR	"William Speirs <bill.speirs@gmail.com>"
-#define DRIVER_DESC	"A block device controlled by a user space program"
 
 /**
  * Block device code tutorial: https://linux-kernel-labs.github.io/master/labs/block_device_drivers.html
@@ -18,18 +15,21 @@
 /**
  * Constants/parameters
  */
-#define USER_SPACE_BLKDEV_MAJOR     243
-#define USER_SPACE_BLKDEV_MINORS    1
-#define USER_SPACE_BLKDEV_NAME      "usbd"
-#define SECTOR_SHIFT                9
-#define SECTOR_SIZE                 (1 << SECTOR_SHIFT)
+#define DRIVER_NAME     "usbd"
+#define DRIVER_VERSION	"0.0.1"
+#define DRIVER_AUTHOR	"William Speirs <bill.speirs@gmail.com>"
+#define DRIVER_DESC	    "A block device controlled by a user space program"
+#define USBD_MAJOR      243
+#define USBD_MINOR      1
+#define SECTOR_SHIFT    9
+#define SECTOR_SIZE     (1 << SECTOR_SHIFT)
 
 static int DEVICE_SIZE = 1024; // size in sectors
 module_param(DEVICE_SIZE, int, 0444); // make world-readable
 
 
 /**
- * Representation of the device
+ * Representation of the block device
  */
 static struct usbd_dev {
     int open_count;
@@ -37,6 +37,15 @@ static struct usbd_dev {
     struct request_queue *queue;
     struct gendisk *gd;
 } dev;
+
+/**
+ * Info about the UIO
+ */
+static struct uio_info usbd_uio_info = {
+    .name       = DRIVER_NAME,
+    .version    = DRIVER_VERSION,
+    .mem        = struct uio_mem[] { }
+};
 
 /**
  * Handle transfering data to/from the device
@@ -113,10 +122,10 @@ static void usbd_release(struct gendisk *gd, fmode_t mode)
     printk(KERN_INFO "Released usbd, count %d", dev->open_count);
 }
 
-struct block_device_operations user_space_block_ops = {
-    .owner = THIS_MODULE,
-    .open = usbd_open,
-    .release = usbd_release
+struct block_device_operations usbd_block_ops = {
+    .owner      = THIS_MODULE,
+    .open       = usbd_open,
+    .release    = usbd_release
 };
 
 /**
@@ -127,7 +136,7 @@ static int create_block_device(struct usbd_dev *dev)
     int status;
 
     // register the device
-    status = register_blkdev(USER_SPACE_BLKDEV_MAJOR, USER_SPACE_BLKDEV_NAME);
+    status = register_blkdev(USBD_MAJOR, DRIVER_NAME);
 
     if(status < 0) {
         printk(KERN_ERR "Unable to register user space block device\n");
@@ -148,7 +157,7 @@ static int create_block_device(struct usbd_dev *dev)
     dev->queue->queuedata = dev;
 
     // allocate the disk
-    dev->gd = alloc_disk(USER_SPACE_BLKDEV_MINORS);
+    dev->gd = alloc_disk(USBD_MINOR);
 
     if (!dev->gd) {
         printk (KERN_NOTICE "alloc_disk failure\n");
@@ -156,9 +165,9 @@ static int create_block_device(struct usbd_dev *dev)
     }
 
     // configure the gendisk struct
-    dev->gd->major = USER_SPACE_BLKDEV_MAJOR;
+    dev->gd->major = USBD_MAJOR;
     dev->gd->first_minor = 0;
-    dev->gd->fops = &user_space_block_ops;
+    dev->gd->fops = &usbd_block_ops;
     dev->gd->queue = dev->queue;
     dev->gd->private_data = dev;
     snprintf (dev->gd->disk_name, 32, "usbd");
@@ -174,7 +183,7 @@ static int create_block_device(struct usbd_dev *dev)
 
 // handle any errors by unregistering the block device, and returning ENOMEM
 out_err:
-	unregister_blkdev(USER_SPACE_BLKDEV_MAJOR, USER_SPACE_BLKDEV_NAME);
+	unregister_blkdev(USBD_MAJOR, DRIVER_NAME);
     return -ENOMEM;
 }
 
@@ -192,7 +201,7 @@ static void delete_block_device(struct usbd_dev *dev)
         kobject_put(&dev->queue->kobj);
 
     // unregister the device
-    unregister_blkdev(USER_SPACE_BLKDEV_MAJOR, USER_SPACE_BLKDEV_NAME);
+    unregister_blkdev(USBD_MAJOR, DRIVER_NAME);
 }
 
 /*
