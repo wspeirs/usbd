@@ -104,6 +104,10 @@ static blk_qc_t usbd_make_request(struct request_queue *q, struct bio *bio)
                     // set the state of the driver
                     dev.driver_state = WAITING_ON_PROC_RESPONSE;
 
+                    // wake up the proc side
+                    // use _sync call because we're just about to go to sleep
+                    wake_up_interruptible_sync(&dev.wait_queue);
+
                     // put ourself on the wait queue
                     wait_event_interruptible(dev.wait_queue, dev.driver_state == WAITING_ON_BLK_DEV_REQUEST);
                 } else {
@@ -111,6 +115,10 @@ static blk_qc_t usbd_make_request(struct request_queue *q, struct bio *bio)
 
                     // set the state of the driver
                     dev.driver_state = WAITING_ON_PROC_RESPONSE;
+
+                    // wake up the proc side
+                    // use _sync call because we're just about to go to sleep
+                    wake_up_interruptible_sync(&dev.wait_queue);
 
                     // put ourself on the wait queue
                     wait_event_interruptible(dev.wait_queue, dev.driver_state == WAITING_ON_BLK_DEV_REQUEST);
@@ -373,6 +381,9 @@ static ssize_t io_write(struct file *f, const char __user *buff, size_t amt, lof
 
     // set our driver state as the proc returned from processing the request
     dev.driver_state = WAITING_ON_BLK_DEV_REQUEST;
+
+    // wake up the block device side
+    wake_up_interruptible(&dev.wait_queue);
 
     // simply return that we wrote whatever was sent to us
     return amt;
