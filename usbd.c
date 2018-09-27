@@ -60,8 +60,10 @@ static struct usbd_t {
  * Serialized struct that is passed via read/write calls from/to the IO file.
  */
 struct io_request_response_t {
-    unsigned int type; // 1 = write; 0 = read
-    size_t amount;  // < 0 for error
+    u64 type;   // 1 = write; 0 = read
+    u64 amount; // < 0 for error
+    u64 lba;    // the block address
+
 } request_response;
 
 
@@ -72,7 +74,7 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
 {
 	struct bio_vec bvec;
     struct bvec_iter iter;
-	sector_t sector = bio->bi_iter.bi_sector;
+	sector_t lba = bio->bi_iter.bi_sector;
 
     // switch on the operation (enum req_opf)
     switch(bio_op(bio)) {
@@ -84,7 +86,7 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
             unsigned buffer_size = bio_cur_bytes(bio); // get the size of the buffer
             unsigned cur_offset = 0;
 
-            printk(KERN_INFO "BUFFER MAP: %p + %u\n", bvec.bv_page, bvec.bv_offset);
+//            printk(KERN_INFO "BUFFER MAP: %p + %u\n", bvec.bv_page, bvec.bv_offset);
 
             // go through the buffer's size, a page at a time
             while(cur_offset < buffer_size) {
@@ -92,9 +94,9 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
                 size_t amt = min(buffer_size - cur_offset, (unsigned) PAGE_SIZE);
 
                 if(bio_data_dir(bio) == WRITE) {
-                    printk(KERN_INFO "BLK DEV WRITE: %u bytes starting at %lu\n", buffer_size, sector);
+                    printk(KERN_INFO "BLK DEV WRITE: %u bytes\tLBA: %lu\n", buffer_size, lba);
 
-                    printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", usbd.buffer, buffer, amt);
+//                    printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", usbd.buffer, buffer, amt);
 
                     // copy the request into the IO buffer
                     memcpy(usbd.buffer, buffer, amt);
@@ -102,6 +104,7 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
                     // fill out the io_request_response_t
                     request_response.amount = amt;
                     request_response.type = 1;
+                    request_response.lba = lba;
 
                     // set the state of the driver
                     usbd.driver_state = WAITING_ON_PROC_RESPONSE;
@@ -113,7 +116,7 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
                     // put ourself on the wait queue
                     wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_BLK_DEV_REQUEST);
                 } else {
-                    printk(KERN_INFO "BLK DEV READ: %u bytes starting at %lu\n", buffer_size, sector);
+                    printk(KERN_INFO "BLK DEV READ: %u bytes\tLBA %lu\n", buffer_size, lba);
 
                     // set the state of the driver
                     usbd.driver_state = WAITING_ON_PROC_RESPONSE;
@@ -126,12 +129,12 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
                     wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_BLK_DEV_REQUEST);
 
                     if(request_response.amount > 0) {
-                        printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", buffer, usbd.buffer, amt);
+//                        printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", buffer, usbd.buffer, amt);
 
                         // read the response from the proc
                         memcpy(buffer, usbd.buffer, amt);
                     } else {
-                        printk(KERN_ERR "Got an error response back: %lu\n", request_response.amount);
+                        printk(KERN_ERR "Got an error response back: %llu\n", request_response.amount);
                     }
                 }
 
@@ -139,8 +142,8 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
                 cur_offset += amt;
             }
 
-            // update the current sector
-            sector += (buffer_size >> SECTOR_SHIFT);
+            // update the current lba
+            lba += (buffer_size >> SECTOR_SHIFT);
 
             // unmap the buffer
             kunmap_atomic(buffer);
@@ -148,6 +151,7 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
         break;
 
     default:
+        printk(KERN_INFO "Got an unknown blk dev command: %u", bio_op(bio));
         break;
     }
 
@@ -378,7 +382,7 @@ static ssize_t io_read(struct file *f, char __user *buff, size_t amt, loff_t *of
     // wait to process a response
     wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_PROC_RESPONSE);
 
-    printk(KERN_INFO "io_read: type: %u amt: %lu", request_response.type, request_response.amount);
+    printk(KERN_INFO "io_read: type: 0x%0llX amt: %llu", request_response.type, request_response.amount);
 
     // copy the io_request_response_t into the buffer
     memcpy(buff, &request_response, sizeof(struct io_request_response_t));
