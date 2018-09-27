@@ -22,30 +22,30 @@ int main(int argc, char **argv)
     fd = open("/proc/usbd_io", O_RDWR | O_SYNC);
 
     if(fd < 0) {
-        printf("Error opening /proc/usbd_io: %d", fd);
+        printf("Error opening /proc/usbd_io: %d\n", fd);
         return -1;
     }
 
-    printf("Opened /proc/usbd_io");
+    printf("Opened /proc/usbd_io\n");
 
     // mmap in our file
     buffer = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
-    printf("mmap /proc/usbd_io: %x", (unsigned int)buffer);
+    printf("mmap /proc/usbd_io: %p\n", buffer);
 
     // wait on a read
     ret = read(fd, &request_response, sizeof(struct io_request_response_t));
 
     if(ret < 0) {
-        printf("Error reading: %d", ret);
+        printf("Error reading: %d\n", ret);
         close(fd);
         return -1;
     }
 
-    printf("Read %d of %lu", ret, sizeof(struct io_request_response_t));
-    printf("Type: %u Size: %lu", request_response.type, request_response.amount);
+    printf("Read %d of %lu\n", ret, sizeof(struct io_request_response_t));
+    printf("Type: %u Size: %lu\n", request_response.type, request_response.amount);
 
-    printf("%x", buffer[0]);
+    printf("Buffer: 0x%X\n", buffer[0]);
 
     request_response.amount = 1;
 
