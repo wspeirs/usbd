@@ -28,10 +28,10 @@
 #define DRIVER_DESC	    "A block device controlled by a user space program"
 #define USBD_MAJOR      243
 #define USBD_MINOR      1
-#define SECTOR_SHIFT    9
+#define SECTOR_SHIFT    12
 #define SECTOR_SIZE     (1 << SECTOR_SHIFT)
 
-static int DEVICE_SIZE = 1024; // size in sectors
+static int DEVICE_SIZE = 1000; // size in 512-byte sectors
 module_param(DEVICE_SIZE, int, 0444); // make world-readable
 
 /**
@@ -61,7 +61,6 @@ static struct usbd_t {
  */
 struct io_request_response_t {
     u64 type;   // 1 = write; 0 = read
-    u64 amount; // < 0 for error
     u64 lba;    // the block address
 
 } request_response;
@@ -74,7 +73,7 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
 {
 	struct bio_vec bvec;
     struct bvec_iter iter;
-	sector_t lba = bio->bi_iter.bi_sector;
+	sector_t lba = bio->bi_iter.bi_sector >> 3; // need to convert from 512-byte sectors to 4096-byte pages
 
     // switch on the operation (enum req_opf)
     switch(bio_op(bio)) {
@@ -84,65 +83,61 @@ static blk_qc_t dev_make_request(struct request_queue *q, struct bio *bio)
         bio_for_each_segment(bvec, bio, iter) {
             char *buffer = kmap_atomic(bvec.bv_page) + bvec.bv_offset; // map in our buffer
             unsigned buffer_size = bio_cur_bytes(bio); // get the size of the buffer
-            unsigned cur_offset = 0;
 
-//            printk(KERN_INFO "BUFFER MAP: %p + %u\n", bvec.bv_page, bvec.bv_offset);
+            if(buffer_size != SECTOR_SIZE) {
+                printk(KERN_ERR "Buffer size is not a page: %u != %u\n", buffer_size, SECTOR_SIZE);
+            }
 
-            // go through the buffer's size, a page at a time
-            while(cur_offset < buffer_size) {
-                // get the amount of data we're going to copy
-                size_t amt = min(buffer_size - cur_offset, (unsigned) PAGE_SIZE);
+            if(bio_data_dir(bio) == WRITE) {
+                printk(KERN_INFO "BLK DEV WRITE: %u bytes\tLBA: %lu\n", buffer_size, lba);
 
-                if(bio_data_dir(bio) == WRITE) {
-                    printk(KERN_INFO "BLK DEV WRITE: %u bytes\tLBA: %lu\n", buffer_size, lba);
+//                printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", usbd.buffer, buffer, amt);
 
-//                    printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", usbd.buffer, buffer, amt);
+                // copy the request into the IO buffer
+                memcpy(usbd.buffer, buffer, SECTOR_SIZE);
 
-                    // copy the request into the IO buffer
-                    memcpy(usbd.buffer, buffer, amt);
+                // fill out the io_request_response_t
+                request_response.type = 1;
+                request_response.lba = lba;
 
-                    // fill out the io_request_response_t
-                    request_response.amount = amt;
-                    request_response.type = 1;
-                    request_response.lba = lba;
+                // set the state of the driver
+                usbd.driver_state = WAITING_ON_PROC_RESPONSE;
 
-                    // set the state of the driver
-                    usbd.driver_state = WAITING_ON_PROC_RESPONSE;
+                // wake up the proc side
+                // use _sync call because we're just about to go to sleep
+                wake_up_interruptible_sync(&usbd.wait_queue);
 
-                    // wake up the proc side
-                    // use _sync call because we're just about to go to sleep
-                    wake_up_interruptible_sync(&usbd.wait_queue);
+                // put ourself on the wait queue
+                wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_BLK_DEV_REQUEST);
+            } else {
+                printk(KERN_INFO "BLK DEV READ: %u bytes\tLBA %lu\n", buffer_size, lba);
 
-                    // put ourself on the wait queue
-                    wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_BLK_DEV_REQUEST);
+                // fill out the io_request_response_t
+                request_response.type = 0;
+                request_response.lba = lba;
+
+                // set the state of the driver
+                usbd.driver_state = WAITING_ON_PROC_RESPONSE;
+
+                // wake up the proc side
+                // use _sync call because we're just about to go to sleep
+                wake_up_interruptible_sync(&usbd.wait_queue);
+
+                // put ourself on the wait queue
+                wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_BLK_DEV_REQUEST);
+
+                if(request_response.type == 0) {
+//                    printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", buffer, usbd.buffer, amt);
+
+                    // read the response from the proc
+                    memcpy(buffer, usbd.buffer, SECTOR_SIZE);
                 } else {
-                    printk(KERN_INFO "BLK DEV READ: %u bytes\tLBA %lu\n", buffer_size, lba);
-
-                    // set the state of the driver
-                    usbd.driver_state = WAITING_ON_PROC_RESPONSE;
-
-                    // wake up the proc side
-                    // use _sync call because we're just about to go to sleep
-                    wake_up_interruptible_sync(&usbd.wait_queue);
-
-                    // put ourself on the wait queue
-                    wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_BLK_DEV_REQUEST);
-
-                    if(request_response.amount > 0) {
-//                        printk(KERN_INFO "BLK DEV COPY: 0x%p -> 0x%p (%lu)\n", buffer, usbd.buffer, amt);
-
-                        // read the response from the proc
-                        memcpy(buffer, usbd.buffer, amt);
-                    } else {
-                        printk(KERN_ERR "Got an error response back: %llu\n", request_response.amount);
-                    }
+                    printk(KERN_ERR "Got an error response back: 0x%08llX\n", request_response.type);
                 }
-
-                // update our offset
-                cur_offset += amt;
             }
 
             // update the current lba
+            printk(KERN_INFO "LBA: %lu -> %lu (%u)", lba, lba + (buffer_size >> SECTOR_SHIFT), (buffer_size >> SECTOR_SHIFT));
             lba += (buffer_size >> SECTOR_SHIFT);
 
             // unmap the buffer
@@ -377,12 +372,10 @@ static int io_release(struct inode *node, struct file *f)
 
 static ssize_t io_read(struct file *f, char __user *buff, size_t amt, loff_t *offset)
 {
-    printk(KERN_INFO "io_read: %zu at %lld\n", amt, *offset);
-
     // wait to process a response
     wait_event_interruptible(usbd.wait_queue, usbd.driver_state == WAITING_ON_PROC_RESPONSE);
 
-    printk(KERN_INFO "io_read: type: 0x%0llX amt: %llu", request_response.type, request_response.amount);
+    printk(KERN_INFO "io_read: type: 0x%0llX LBA: %llu", request_response.type, request_response.lba);
 
     // copy the io_request_response_t into the buffer
     memcpy(buff, &request_response, sizeof(struct io_request_response_t));
@@ -393,10 +386,10 @@ static ssize_t io_read(struct file *f, char __user *buff, size_t amt, loff_t *of
 
 static ssize_t io_write(struct file *f, const char __user *buff, size_t amt, loff_t *offset)
 {
-    printk(KERN_INFO "io_write: 0x%p %lu at %lld\n", buff, amt, *offset);
-
     // copy over the response
     memcpy(&request_response, buff, sizeof(struct io_request_response_t));
+
+    printk(KERN_INFO "io_write: type: 0x%08llX\n", request_response.type);
 
     // set our driver state as the proc returned from processing the request
     usbd.driver_state = WAITING_ON_BLK_DEV_REQUEST;
